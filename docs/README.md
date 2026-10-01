@@ -2,6 +2,7 @@
 
 This plugin runs the official [code-server](https://github.com/coder/code-server) release and mounts its VS Code web editor in the POM admin UI. The editor opens the POM's shared `workspace_root`; its settings, extensions and application state persist in the plugin's private data directory.
 
+The Plugins page screenshot gallery uses the two images requested for this plugin: the [VS Code logo](https://miro.medium.com/0*S0gllBsD11p4kfwO.png) and the [editor screenshot](https://user-images.githubusercontent.com/35271042/118224532-3842c400-b438-11eb-923d-a5f66fa6785a.png).
 ## Access and runtime
 
 The menu and route are **admin-only** because the editor can run terminal commands as the POM process and access files visible on that node. code-server is configured with `--auth=none`, but binds only to a private loopback port. A second loopback proxy requires the per-launch token supplied by POM's `ui.upstream` proxy contract; browser traffic reaches it only through the POM's same-origin, admin-authorized plugin proxy. Neither the code-server port nor its token is sent to the browser.

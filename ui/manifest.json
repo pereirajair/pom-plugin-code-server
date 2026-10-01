@@ -6,6 +6,10 @@
     "en": "Run the official code-server VS Code experience in the POM admin UI, backed by the POM shared workspace.",
     "pt-BR": "Use a experiência oficial do VS Code via code-server na interface administrativa do POM, conectada ao workspace compartilhado."
   },
+  "screenshots": [
+    "docs/screenshots/code-server-brand.png",
+    "docs/screenshots/code-server-editor.png"
+  ],
   "documentation": {
     "guides": [
       {

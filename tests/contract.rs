@@ -86,6 +86,27 @@ fn manifest_assets_and_locales_are_complete() {
 }
 
 #[test]
+fn screenshot_gallery_points_to_the_supplied_repository_images() {
+    let manifest = json("ui/manifest.json");
+    let screenshots = manifest["screenshots"].as_array().expect("screenshots");
+    assert_eq!(screenshots.len(), 2);
+    let assets: BTreeSet<_> = manifest["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|asset| asset.as_str().unwrap())
+        .collect();
+    for image in screenshots {
+        let path = image.as_str().unwrap();
+        assert!(path.starts_with("docs/screenshots/") && path.ends_with(".png"));
+        assert!(!assets.contains(path));
+        assert!(fs::read(root().join(path))
+            .unwrap()
+            .starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+}
+
+#[test]
 fn release_contract_is_namespaced_and_published_as_a_public_github_plugin() {
     let release = json("release/manifest.json");
     assert_eq!(release["schema"], 1);
