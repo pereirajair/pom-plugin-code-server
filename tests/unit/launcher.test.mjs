@@ -56,7 +56,7 @@ function fakeRelease(root) {
       if (req.url === "/healthz") { res.writeHead(200).end("ok"); return; }
       if (req.url === "/echo") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ host: req.headers.host, forwardedHost: req.headers["x-forwarded-host"], prefix: req.headers["x-forwarded-prefix"] }));
+        res.end(JSON.stringify({ host: req.headers.host, forwardedHost: req.headers["x-forwarded-host"], prefix: req.headers["x-forwarded-prefix"], folder: process.argv.at(-1) }));
         return;
       }
       if (req.url === "/redirect") { res.writeHead(302, { location: "/login?from=test" }).end(); return; }
@@ -159,6 +159,7 @@ test("launcher gates HTTP and WebSocket traffic and mounts code-server below the
     host: "pom.example.test:443",
     forwardedHost: "pom.example.test:443",
     prefix: PREFIX,
+    folder: join(root, "workspace"),
   });
 
   const redirect = await get(`${base}/redirect`, { ...headers, "x-forwarded-prefix": PREFIX });
