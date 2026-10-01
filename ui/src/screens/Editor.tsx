@@ -77,7 +77,7 @@ export function Editor() {
         <iframe
           key={reload}
           className="cs-frame"
-          src={`${PROXY}/`}
+          src={PROXY}
           title={t("frameTitle")}
           allow="clipboard-read; clipboard-write"
         />

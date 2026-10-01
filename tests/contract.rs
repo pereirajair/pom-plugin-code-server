@@ -55,8 +55,10 @@ fn manifest_assets_and_locales_are_complete() {
             "docs/README.md",
         ])
     );
-    assert!(text("ui/src/screens/Editor.tsx").contains("/_pom/status"));
-    assert!(text("ui/src/screens/Editor.tsx").contains("/_pom/restart"));
+    let editor = text("ui/src/screens/Editor.tsx");
+    assert!(editor.contains("/_pom/status"));
+    assert!(editor.contains("/_pom/restart"));
+    assert!(editor.contains("src={PROXY}"));
     assert!(fs::read(root().join("ui/icon.png"))
         .unwrap()
         .starts_with(b"\x89PNG\r\n\x1a\n"));
