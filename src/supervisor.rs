@@ -469,9 +469,11 @@ mod tests {
                 .workspace_root,
             None
         );
+        let workspace = std::env::temp_dir().join("pom-code-server-workspace");
+        let workspace_text = workspace.to_string_lossy().into_owned();
         let parsed =
-            Configuration::from_configure(&json!({"workspace_root": "/tmp/workspace"})).unwrap();
-        assert_eq!(parsed.workspace_root, Some(PathBuf::from("/tmp/workspace")));
+            Configuration::from_configure(&json!({"workspace_root": workspace_text})).unwrap();
+        assert_eq!(parsed.workspace_root, Some(workspace));
         assert!(Configuration::from_configure(&json!({"workspace_root": 42})).is_err());
         assert!(Configuration::from_configure(&json!({"workspace_root": "relative"})).is_err());
     }
