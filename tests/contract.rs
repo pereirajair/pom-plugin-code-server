@@ -119,7 +119,8 @@ fn release_contract_is_namespaced_and_published_as_a_public_github_plugin() {
 
     let package = text("scripts/package.sh");
     assert!(package.contains("pom-plugin-${platform}.json"));
-    assert!(package.contains("code_server_version"));
+    assert!(package.contains("  \"code_server_version\": \"${resolved_code_server}\""));
+    assert!(package.contains(r#"'($contract[0]) + {release_id:$release_id, version:$version, os:$os, arch:$arch, asset:$asset, sha256:$sha256, size:$size}'"#));
     let workflow = text(".github/workflows/publish-release.yml");
     assert!(workflow.contains("softprops/action-gh-release"));
     assert!(!workflow.contains("license-server") && !workflow.contains("POM_RELEASE_TOKEN"));

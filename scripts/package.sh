@@ -71,8 +71,8 @@ jq -n \
   --slurpfile contract "$root/release/manifest.json" \
   --arg release_id "v${version}" --arg version "$version" \
   --arg os "$os" --arg arch "$arch" --arg asset "$(basename "$artifact")" \
-  --arg sha256 "$sha" --argjson size "$size" --arg code_server_version "$resolved_code_server" \
-  '($contract[0]) + {release_id:$release_id, version:$version, os:$os, arch:$arch, asset:$asset, sha256:$sha256, size:$size, code_server_version:$code_server_version}' \
+  --arg sha256 "$sha" --argjson size "$size" \
+  '($contract[0]) + {release_id:$release_id, version:$version, os:$os, arch:$arch, asset:$asset, sha256:$sha256, size:$size}' \
   > "$public_manifest" || die 'could not generate the GitHub release manifest'
 printf 'artifact=%s\nmetadata=%s\npublic_manifest=%s\nsha256=%s\nsize=%s\nversion=%s\nplatform=%s\ncode_server_version=%s\n' \
   "$artifact" "$metadata" "$public_manifest" "$sha" "$size" "$version" "$platform" "$resolved_code_server"
