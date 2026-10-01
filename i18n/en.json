@@ -1,0 +1,10 @@
+{
+  "starting": "Starting code-server…",
+  "startingDetail": "The first launch installs the bundled VS Code runtime. It can take a few minutes.",
+  "failed": "Code-server could not start",
+  "failedDetail": "Check the POM node logs, then try starting the editor again.",
+  "unavailableDetail": "The POM could not reach the plugin. Check the node logs and reactivate the plugin from Plugins.",
+  "retry": "Restart editor",
+  "frameTitle": "Code-server editor",
+  "version": "code-server {version}"
+}

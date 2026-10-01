@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "plugin_code": "code_server",
+  "plugin_abi": 1,
+  "feature_set": ["code_server.editor"]
+}

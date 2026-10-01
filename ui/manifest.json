@@ -1,0 +1,39 @@
+{
+  "schema": "pom-plugin-ui/v1",
+  "plugin_code": "code_server",
+  "icon_image": "ui/icon.png",
+  "description": {
+    "en": "Run the official code-server VS Code experience in the POM admin UI, backed by the POM shared workspace.",
+    "pt-BR": "Use a experiência oficial do VS Code via code-server na interface administrativa do POM, conectada ao workspace compartilhado."
+  },
+  "documentation": {
+    "guides": [
+      {
+        "id": "overview",
+        "title": { "en": "Code-server in POM", "pt-BR": "Code-server no POM" },
+        "asset": "docs/README.md"
+      }
+    ],
+    "reference": []
+  },
+  "menu": [
+    {
+      "id": "editor",
+      "label": { "en": "Code-server", "pt-BR": "Code-server" },
+      "icon": "terminal",
+      "to": "/editor",
+      "roles": ["admin"]
+    }
+  ],
+  "routes": [
+    { "path": "/editor", "screen": "editor", "full_bleed": true, "roles": ["admin"] }
+  ],
+  "screens": {
+    "editor": { "module": "ui/screens.js", "export": "editor", "styles": ["ui/plugin.css"] }
+  },
+  "i18n": {
+    "en": "i18n/en.json",
+    "pt-BR": "i18n/pt-BR.json"
+  },
+  "assets": ["ui/screens.js", "ui/plugin.css", "ui/icon.png", "i18n/en.json", "i18n/pt-BR.json", "docs/README.md"]
+}

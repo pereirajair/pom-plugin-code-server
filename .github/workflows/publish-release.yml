@@ -1,0 +1,126 @@
+name: Publish plugin release
+
+on:
+  workflow_dispatch:
+    inputs:
+      linux:
+        description: Release Linux x86_64
+        type: boolean
+        default: false
+      version_linux:
+        description: Linux plugin version tag, for example v0.1.0
+        type: string
+        default: ''
+      macos:
+        description: Release macOS arm64
+        type: boolean
+        default: false
+      version_macos:
+        description: macOS plugin version tag, for example v0.1.0
+        type: string
+        default: ''
+      windows:
+        description: Release Windows x86_64
+        type: boolean
+        default: false
+      version_windows:
+        description: Windows plugin version tag, for example v0.1.0
+        type: string
+        default: ''
+      code_server_version:
+        description: Official code-server release tag or version to bundle
+        type: string
+        default: latest
+      prerelease:
+        description: Mark the GitHub release as a prerelease
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: plan
+        shell: bash
+        run: echo "matrix=$(./scripts/ci-plan.sh)" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_LINUX: ${{ inputs.linux }}
+          VERSION_LINUX: ${{ inputs.version_linux }}
+          RELEASE_MACOS: ${{ inputs.macos }}
+          VERSION_MACOS: ${{ inputs.version_macos }}
+          RELEASE_WINDOWS: ${{ inputs.windows }}
+          VERSION_WINDOWS: ${{ inputs.version_windows }}
+
+  build:
+    name: Build ${{ matrix.name }} ${{ matrix.version }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Build and package the selected official release
+        shell: bash
+        run: ./scripts/package.sh --platform "$PLATFORM" --version "${RELEASE_TAG#v}" --code-server-version "$CODE_SERVER_VERSION"
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          RELEASE_TAG: ${{ matrix.version }}
+          CODE_SERVER_VERSION: ${{ inputs.code_server_version }}
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Test plugin contract
+        shell: bash
+        run: cargo test --locked && cargo fmt --check && node --test tests/unit/*.test.mjs && tests/test_ci_plan.sh
+        env:
+          POM_UI_REQUIRE_DIST: '1'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ matrix.name }}
+          path: |
+            dist-release/pom-plugin-code-server-${{ matrix.platform }}.${{ matrix.ext }}
+            dist-release/pom-plugin-code-server-${{ matrix.platform }}.metadata.json
+            dist-release/pom-plugin-${{ matrix.platform }}.json
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Release ${{ matrix.name }} ${{ matrix.version }}
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: plugin-${{ matrix.name }}
+          path: packages
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ matrix.version }}
+          name: ${{ matrix.version }}
+          prerelease: ${{ inputs.prerelease }}
+          files: packages/*
