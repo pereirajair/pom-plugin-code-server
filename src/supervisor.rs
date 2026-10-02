@@ -480,6 +480,17 @@ fn runtime_ready(target: &Path, server_root: &str) -> bool {
         && target.join("launcher.mjs").is_file()
 }
 
+/// A runtime unpacked by an older plugin version carries that version's
+/// launcher: the code-server release can be the same while the launcher
+/// changed, so the installed plugin always writes its own.
+fn refresh_launcher(target: &Path, launcher: &str) -> Result<(), String> {
+    let path = target.join("launcher.mjs");
+    if fs::read_to_string(&path).is_ok_and(|current| current == launcher) {
+        return Ok(());
+    }
+    fs::write(&path, launcher).map_err(|error| format!("write code-server launcher: {error}"))
+}
+
 fn validate_release(checksum: &str, server_root: &str) -> Result<(), String> {
     if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("code-server archive checksum is invalid".into());
@@ -560,6 +571,7 @@ pub fn install_runtime(
     validate_release(release.checksum, release.server_root)?;
     let target = root.join(&release.checksum[..16]);
     if runtime_ready(&target, release.server_root) {
+        refresh_launcher(&target, launcher)?;
         return Ok(target);
     }
     fs::create_dir_all(root).map_err(|error| format!("{}: {error}", root.display()))?;
@@ -593,6 +605,7 @@ pub fn unpack_archive_file(
     let id = &checksum[..16];
     let target = root.join(id);
     if runtime_ready(&target, server_root) {
+        refresh_launcher(&target, launcher)?;
         return Ok(target);
     }
     let mut hasher = Sha256::new();
@@ -823,9 +836,14 @@ mod tests {
             fs::read(runtime.join("launcher.mjs")).unwrap(),
             b"// launcher"
         );
+        // Reused without re-unpacking, but with the installed plugin's launcher.
         assert_eq!(
-            unpack_runtime(&root, &[], &digest, "code-server-test", "ignored").unwrap(),
+            unpack_runtime(&root, &[], &digest, "code-server-test", "// newer launcher").unwrap(),
             runtime
+        );
+        assert_eq!(
+            fs::read(runtime.join("launcher.mjs")).unwrap(),
+            b"// newer launcher"
         );
         assert!(unpack_runtime(&root, &first, &"0".repeat(64), "code-server-test", "").is_err());
 
