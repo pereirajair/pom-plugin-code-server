@@ -9,3 +9,12 @@ export function usePluginI18n(): ReturnType<I18nHook> {
   const { t, locale } = host.hooks.useI18n();
   return { t: (key, values) => t(`${__POM_PLUGIN_CODE__}.${key}`, values), locale };
 }
+
+type Rpc = <T>(op: string, params?: unknown) => Promise<T>;
+
+/** The plugin's own API through the POM (host version 4), when available. */
+export function pluginRpc(): Rpc | null {
+  const host = (globalThis as typeof globalThis & { __POM_HOST__?: { plugin?: (code: string) => { rpc?: Rpc } } }).__POM_HOST__;
+  const scoped = typeof host?.plugin === "function" ? host.plugin(__POM_PLUGIN_CODE__) : null;
+  return typeof scoped?.rpc === "function" ? scoped.rpc : null;
+}

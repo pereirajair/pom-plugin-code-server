@@ -1,19 +1,49 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { usePluginI18n } from "../host/runtime";
+import { pluginRpc, usePluginI18n } from "../host/runtime";
 
 const PROXY = "/api/ui/plugins/code_server/proxy";
 
-type RuntimeStatus = { status?: string; error?: string; detail?: { version?: string } };
+type RuntimeStatus = {
+  status?: string;
+  error?: string;
+  detail?: { version?: string; downloaded?: number; total?: number };
+};
+
+const megabytes = (bytes: number) => (bytes / (1024 * 1024)).toFixed(0);
 
 export function Editor() {
   const { t } = usePluginI18n();
   const [state, setState] = useState<"starting" | "ready" | "error">("starting");
   const [message, setMessage] = useState("");
   const [canRestart, setCanRestart] = useState(false);
+  const [install, setInstall] = useState<{ downloaded: number; total: number; version: string } | null>(null);
   const [reload, setReload] = useState(0);
   const startedAt = useRef(Date.now());
 
   const poll = useCallback(async (signal: AbortSignal) => {
+    // While the runtime downloads there is no editor to proxy to: ask the
+    // plugin itself for progress (POM plugin RPC).
+    const rpc = pluginRpc();
+    if (rpc) {
+      try {
+        const own = await rpc<RuntimeStatus>("runtime.status");
+        if (own.status === "installing") {
+          setState("starting");
+          setInstall({ downloaded: own.detail?.downloaded ?? 0, total: own.detail?.total ?? 0, version: own.detail?.version ?? "" });
+          startedAt.current = Date.now();
+          return;
+        }
+        setInstall(null);
+        if (own.status === "error") {
+          setState("error");
+          setMessage(own.error ?? t("failedDetail"));
+          setCanRestart(true);
+          return;
+        }
+      } catch {
+        // Fall back to the editor proxy below.
+      }
+    }
     try {
       const response = await fetch(`${PROXY}/_pom/status`, { cache: "no-store", signal });
       if (!response.ok) {
@@ -62,7 +92,12 @@ export function Editor() {
     startedAt.current = Date.now();
     try {
       const response = await fetch(`${PROXY}/_pom/restart`, { method: "POST", cache: "no-store" });
-      if (!response.ok) throw new Error("restart unavailable");
+      if (!response.ok) {
+        // No editor process (e.g. the download failed): restart the plugin side.
+        const rpc = pluginRpc();
+        if (!rpc) throw new Error("restart unavailable");
+        await rpc("runtime.retry");
+      }
       setReload((value) => value + 1);
     } catch {
       setState("error");
@@ -84,8 +119,18 @@ export function Editor() {
       ) : (
         <section className="cs-status" role="status" aria-live="polite">
           {state === "starting" && <span className="cs-spinner" aria-hidden="true" />}
-          <h1 className="cs-title">{state === "error" ? t("failed") : t("starting")}</h1>
-          <p className="cs-detail">{state === "error" ? message : t("startingDetail")}</p>
+          <h1 className="cs-title">{state === "error" ? t("failed") : install ? t("installing") : t("starting")}</h1>
+          <p className="cs-detail">{state === "error" ? message : install ? t("installingDetail", { version: install.version }) : t("startingDetail")}</p>
+          {state === "starting" && install && (
+            <div className="cs-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={install.total ? Math.round((install.downloaded / install.total) * 100) : undefined}>
+              <div className="cs-progress-bar" style={{ width: install.total ? `${(install.downloaded / install.total) * 100}%` : "30%" }} />
+              <span className="cs-progress-label">
+                {install.total
+                  ? t("installingProgress", { done: megabytes(install.downloaded), total: megabytes(install.total), percent: Math.floor((install.downloaded / install.total) * 100) })
+                  : t("installingBytes", { done: megabytes(install.downloaded) })}
+              </span>
+            </div>
+          )}
           {state === "error" && canRestart && (
             <button className="cs-button" type="button" onClick={() => void restart()}>
               {t("retry")}

@@ -1,10 +1,14 @@
 {
   "starting": "Starting code-server…",
-  "startingDetail": "The first launch installs the bundled VS Code runtime. It can take a few minutes.",
+  "startingDetail": "Starting the VS Code runtime on this node.",
   "failed": "Code-server could not start",
   "failedDetail": "Check the POM node logs, then try starting the editor again.",
   "unavailableDetail": "The POM could not reach the plugin. Check the node logs and reactivate the plugin from Plugins.",
   "retry": "Restart editor",
   "frameTitle": "Code-server editor",
-  "version": "code-server {version}"
+  "version": "code-server {version}",
+  "installing": "Downloading VS Code…",
+  "installingDetail": "The first activation downloads the official code-server {version} release once and verifies its checksum. Next starts are immediate.",
+  "installingProgress": "{done} of {total} MB · {percent}%",
+  "installingBytes": "{done} MB"
 }

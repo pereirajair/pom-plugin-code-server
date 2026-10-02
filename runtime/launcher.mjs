@@ -4,7 +4,7 @@
 
 import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { join } from "node:path";
@@ -21,8 +21,15 @@ const token = randomBytes(32).toString("base64url");
 const TOKEN_HEADER = "x-pom-plugin-token";
 const STATUS_PATH = "/_pom/status";
 const RESTART_PATH = "/_pom/restart";
+const SEED_PATH = "/_pom/seed.js";
+const gatewayBase = (env.POM_GATEWAY_BASE_URL || "").replace(/\/+$/, "");
+const gatewayKey = env.POM_GATEWAY_API_KEY || "";
+/** Name of the provider group the plugin owns in chatLanguageModels.json. */
+export const MODEL_GROUP = "POM";
 
 let proxyServer;
+let modelFacade;
+let modelFacadeUrl = "";
 let codeServer;
 let codeServerPort;
 let restartInProgress = false;
@@ -71,6 +78,205 @@ export function proxyResponseHeaders(headers, prefix, forwardedHost) {
   if (result.location) result.location = prefixedLocation(result.location, prefix, forwardedHost);
   if (result["service-worker-allowed"] && prefix) result["service-worker-allowed"] = `${prefix}/`;
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// POM models in the editor's built-in chat.
+//
+// VS Code's chat (the built-in Copilot Chat) can use an Ollama server as a
+// model provider with only a URL, no secret. The launcher serves that Ollama
+// shape on a private loopback path and forwards chat requests to the POM's
+// OpenAI-compatible API with the key the POM minted for this plugin: the key
+// stays in this process, never in code-server's settings or the browser.
+
+/** Ollama `/api/tags` from an OpenAI `/v1/models` list. */
+export function ollamaTags(models) {
+  const list = Array.isArray(models?.data) ? models.data : [];
+  return {
+    models: list
+      .filter((model) => typeof model?.id === "string" && model.id)
+      .map((model) => ({ name: model.id, model: model.id, details: { family: "pom" } })),
+  };
+}
+
+/** Ollama `/api/show` for one POM model; tools are always offered. */
+export function ollamaShow(models, id) {
+  const model = (Array.isArray(models?.data) ? models.data : []).find((entry) => entry?.id === id);
+  const context = Number(model?.context_length ?? model?.top_provider?.context_length ?? model?.max_input_tokens) || 32768;
+  return {
+    model_info: { "general.architecture": "pom", "pom.context_length": context, "general.basename": `${id} (POM)` },
+    capabilities: ["completion", "tools"],
+  };
+}
+
+function readBody(request, limit = 64 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    request.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new Error("request body too large"));
+        request.destroy();
+      } else chunks.push(chunk);
+    });
+    request.on("end", () => resolve(Buffer.concat(chunks)));
+    request.on("error", reject);
+  });
+}
+
+/**
+ * Serves the Ollama-shaped facade under `/<secret>`. Returns the base URL the
+ * chat is configured with. `base`/`key` are injectable for tests.
+ */
+export async function startModelFacade({ base = gatewayBase, key = gatewayKey } = {}) {
+  const secret = randomBytes(18).toString("base64url");
+  const prefix = `/${secret}`;
+  const server = http.createServer(async (request, response) => {
+    const url = new URL(request.url, "http://facade.invalid");
+    if (!url.pathname.startsWith(`${prefix}/`)) {
+      sendJson(response, 404, { error: "not found" });
+      return;
+    }
+    const path = url.pathname.slice(prefix.length);
+    try {
+      if (path === "/api/version" && request.method === "GET") {
+        sendJson(response, 200, { version: "0.12.0" });
+        return;
+      }
+      if (path === "/api/tags" && request.method === "GET") {
+        const models = await fetch(`${base}/models`, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(10_000) });
+        if (!models.ok) throw new Error(`POM /models returned HTTP ${models.status}`);
+        sendJson(response, 200, ollamaTags(await models.json()));
+        return;
+      }
+      if (path === "/api/show" && request.method === "POST") {
+        const body = JSON.parse((await readBody(request, 64 * 1024)).toString("utf8") || "{}");
+        const models = await fetch(`${base}/models`, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(10_000) });
+        sendJson(response, 200, ollamaShow(models.ok ? await models.json() : {}, String(body.model ?? "")));
+        return;
+      }
+      if (path.startsWith("/v1/")) {
+        // `${base}` already ends in `/v1`.
+        const target = `${base}${path.slice(3)}${url.search}`;
+        const body = request.method === "GET" || request.method === "HEAD" ? undefined : await readBody(request);
+        const upstream = await fetch(target, {
+          method: request.method,
+          headers: { "content-type": request.headers["content-type"] || "application/json", authorization: `Bearer ${key}`, accept: request.headers.accept || "*/*" },
+          body,
+        });
+        const headers = { "content-type": upstream.headers.get("content-type") || "application/json", "cache-control": "no-store" };
+        response.writeHead(upstream.status, headers);
+        if (!upstream.body) {
+          response.end();
+          return;
+        }
+        for await (const chunk of upstream.body) response.write(chunk);
+        response.end();
+        return;
+      }
+      sendJson(response, 404, { error: "not found" });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`model facade ${request.method} ${path}: ${message}`);
+      if (!response.headersSent) sendJson(response, 502, { error: message });
+      else response.destroy();
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  return { server, url: `http://127.0.0.1:${server.address().port}${prefix}` };
+}
+
+function readJson(path, fallback) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Upserts (or, without a URL, removes) the plugin's provider group in the
+ * editor's `chatLanguageModels.json`, keeping every group the person added.
+ */
+export function writeChatModels(userDataDir, url) {
+  const directory = join(userDataDir, "User");
+  mkdirSync(directory, { recursive: true });
+  const file = join(directory, "chatLanguageModels.json");
+  const current = readJson(file, []);
+  const groups = (Array.isArray(current) ? current : []).filter((group) => group?.name !== MODEL_GROUP);
+  if (url) groups.push({ name: MODEL_GROUP, vendor: "ollama", url });
+  writeFileSync(file, `${JSON.stringify(groups, null, 2)}\n`);
+}
+
+/**
+ * Lets the built-in chat run without a GitHub account (models come from the
+ * POM). Only sets keys the person has not set; a settings file VS Code wrote
+ * with comments is left untouched rather than rewritten.
+ */
+export function writeChatSettings(userDataDir) {
+  const directory = join(userDataDir, "User");
+  mkdirSync(directory, { recursive: true });
+  const file = join(directory, "settings.json");
+  let settings = {};
+  if (existsSync(file)) {
+    try {
+      settings = JSON.parse(readFileSync(file, "utf8") || "{}");
+    } catch {
+      log("settings.json is not plain JSON; leaving it as is");
+      return;
+    }
+  }
+  if (settings === null || typeof settings !== "object" || Array.isArray(settings)) return;
+  if (settings["chat.allowAnonymousAccess"] !== undefined) return;
+  settings["chat.allowAnonymousAccess"] = true;
+  writeFileSync(file, `${JSON.stringify(settings, null, 2)}\n`);
+}
+
+/**
+ * Runs once per browser before the workbench loads. VS Code disables its
+ * built-in chat extension until a GitHub "chat setup" completes and keeps that
+ * state in the browser (IndexedDB), out of the server's reach. With POM
+ * models no account is needed, so this re-enables the extension and marks the
+ * migration as done, then reloads. A person who later disables the extension
+ * keeps that choice: the marker makes this run only once.
+ */
+export const SEED_SCRIPT = `(function () {
+  var MARK = "pom.code_server.chat.v1";
+  try { if (localStorage.getItem(MARK)) return; } catch (e) { return; }
+  if (window.stop) window.stop();
+  function done() { try { localStorage.setItem(MARK, "1"); } catch (e) {} location.reload(); }
+  var open = indexedDB.open("vscode-web-state-db-global");
+  open.onupgradeneeded = function () { open.result.createObjectStore("ItemTable"); };
+  open.onerror = done;
+  open.onsuccess = function () {
+    var db = open.result;
+    if (!db.objectStoreNames.contains("ItemTable")) { db.close(); done(); return; }
+    var tx = db.transaction("ItemTable", "readwrite");
+    var store = tx.objectStore("ItemTable");
+    var read = store.get("extensionsIdentifiers/disabled");
+    read.onsuccess = function () {
+      var list = [];
+      try { list = JSON.parse(read.result || "[]"); } catch (e) {}
+      if (!Array.isArray(list)) list = [];
+      list = list.filter(function (entry) { return String(entry && entry.id).toLowerCase() !== "github.copilot-chat"; });
+      store.put(JSON.stringify(list), "extensionsIdentifiers/disabled");
+      store.put("true", "builtinChatExtensionEnablementMigration");
+    };
+    tx.oncomplete = function () { db.close(); done(); };
+    tx.onerror = function () { db.close(); done(); };
+  };
+})();
+`;
+
+/** Adds the seed script as the first element of the workbench `<head>`. */
+export function injectSeed(html) {
+  const tag = '<script src="./_pom/seed.js"></script>';
+  if (html.includes(tag)) return html;
+  return html.replace(/<head(\s[^>]*)?>/i, (head) => `${head}\n\t\t${tag}`);
 }
 
 async function freePort() {
@@ -136,6 +342,12 @@ async function startCodeServer() {
 
   const port = await freePort();
   const userData = join(dataDir, "user-data");
+  try {
+    writeChatModels(userData, modelFacadeUrl);
+    if (modelFacadeUrl) writeChatSettings(userData);
+  } catch (error) {
+    log(`could not configure POM models for the chat: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const extensions = join(dataDir, "extensions");
   const args = [
     codeRoot,
@@ -246,15 +458,34 @@ function proxyHttp(request, response, proxyPort) {
     return;
   }
   const prefix = typeof request.headers["x-forwarded-prefix"] === "string" ? request.headers["x-forwarded-prefix"] : "";
+  const pathname = new URL(request.url, "http://code-server.invalid").pathname;
+  // The workbench page gets the one-time chat seed; everything else streams.
+  const workbenchPage = request.method === "GET" && pathname === "/" && /text\/html/.test(request.headers.accept || "");
+  const headers = outgoingHeaders(request.headers, proxyPort);
+  if (workbenchPage) delete headers["accept-encoding"];
   const outbound = http.request({
     hostname: "127.0.0.1",
     port: codeServerPort,
     method: request.method,
     path: request.url,
-    headers: outgoingHeaders(request.headers, proxyPort),
+    headers,
   }, (upstream) => {
-    response.writeHead(upstream.statusCode || 502, proxyResponseHeaders(upstream.headers, prefix, request.headers["x-forwarded-host"]));
-    upstream.pipe(response);
+    const responseHeaders = proxyResponseHeaders(upstream.headers, prefix, request.headers["x-forwarded-host"]);
+    const isHtml = /text\/html/.test(upstream.headers["content-type"] || "") && !upstream.headers["content-encoding"];
+    if (!workbenchPage || !isHtml || upstream.statusCode !== 200) {
+      response.writeHead(upstream.statusCode || 502, responseHeaders);
+      upstream.pipe(response);
+      return;
+    }
+    const chunks = [];
+    upstream.on("data", (chunk) => chunks.push(chunk));
+    upstream.on("end", () => {
+      const body = Buffer.from(injectSeed(Buffer.concat(chunks).toString("utf8")));
+      responseHeaders["content-length"] = String(body.length);
+      response.writeHead(200, responseHeaders);
+      response.end(body);
+    });
+    upstream.on("error", (error) => response.destroy(error));
   });
   outbound.on("error", (error) => {
     log(`proxy ${request.method} ${request.url}: ${error.message}`);
@@ -324,6 +555,17 @@ function startProxyServer() {
       sendJson(response, 200, runtimeStatus);
       return;
     }
+    if (pathname === SEED_PATH && request.method === "GET") {
+      const body = Buffer.from(SEED_SCRIPT);
+      response.writeHead(200, {
+        "content-type": "text/javascript; charset=utf-8",
+        "content-length": body.length,
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      });
+      response.end(body);
+      return;
+    }
     if (pathname === RESTART_PATH && request.method === "POST") {
       sendJson(response, 202, { status: "starting" });
       void restartCodeServer();
@@ -346,11 +588,21 @@ async function shutdown(code = 0) {
   shuttingDown = true;
   runtimeStatus = { status: "stopping" };
   if (proxyServer) proxyServer.close();
+  if (modelFacade) modelFacade.server.close();
   await stopCodeServer();
   process.exit(code);
 }
 
 async function main() {
+  if (gatewayBase && gatewayKey) {
+    try {
+      modelFacade = await startModelFacade();
+      modelFacadeUrl = modelFacade.url;
+      log("POM models available to the editor chat");
+    } catch (error) {
+      log(`model facade unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   proxyServer = await startProxyServer();
   report({ status: "ready", port: proxyServer.address().port, token, detail: { version } });
   void restartCodeServer();

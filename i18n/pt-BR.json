@@ -1,10 +1,14 @@
 {
   "starting": "Iniciando o code-server…",
-  "startingDetail": "A primeira inicialização instala o runtime do VS Code incluído no plugin. Isso pode levar alguns minutos.",
+  "startingDetail": "Iniciando o runtime do VS Code neste nó.",
   "failed": "Não foi possível iniciar o code-server",
   "failedDetail": "Verifique os logs do nó do POM e tente iniciar o editor novamente.",
   "unavailableDetail": "O POM não conseguiu acessar o plugin. Verifique os logs do nó e reative o plugin em Plugins.",
   "retry": "Reiniciar editor",
   "frameTitle": "Editor code-server",
-  "version": "code-server {version}"
+  "version": "code-server {version}",
+  "installing": "Baixando o VS Code…",
+  "installingDetail": "Na primeira ativação, o release oficial do code-server {version} é baixado uma única vez e tem o checksum conferido. As próximas inicializações são imediatas.",
+  "installingProgress": "{done} de {total} MB · {percent}%",
+  "installingBytes": "{done} MB"
 }

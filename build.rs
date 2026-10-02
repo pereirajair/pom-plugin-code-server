@@ -14,9 +14,12 @@ fn content_type(name: &str) -> &'static str {
     }
 }
 
-fn server_archive(generated: &mut String) {
+/// Embeds the pinned release metadata only. The archive itself is downloaded
+/// and verified on the node after installation, keeping the plugin small.
+fn server_release(generated: &mut String) {
     for key in [
-        "CODE_SERVER_ARCHIVE",
+        "CODE_SERVER_URL",
+        "CODE_SERVER_SIZE",
         "CODE_SERVER_SHA256",
         "CODE_SERVER_VERSION",
         "CODE_SERVER_ROOT",
@@ -30,33 +33,27 @@ fn server_archive(generated: &mut String) {
             .join("runtime/launcher.mjs")
             .to_string_lossy()
     ));
-
-    let archive = env::var("CODE_SERVER_ARCHIVE")
-        .ok()
-        .filter(|value| !value.is_empty());
-    let Some(archive) = archive else {
-        generated.push_str("pub static CODE_SERVER_ARCHIVE: &[u8] = &[];\n");
-        generated.push_str("pub static CODE_SERVER_SHA256: &str = \"\";\n");
-        generated.push_str("pub static CODE_SERVER_VERSION: &str = \"\";\n");
-        generated.push_str("pub static CODE_SERVER_ROOT: &str = \"\";\n");
-        return;
-    };
-
-    let checksum = env::var("CODE_SERVER_SHA256").expect("CODE_SERVER_SHA256 is required");
-    assert!(
-        checksum.len() == 64 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "CODE_SERVER_SHA256 must be a SHA-256 hex digest"
-    );
-    let version = env::var("CODE_SERVER_VERSION").expect("CODE_SERVER_VERSION is required");
-    let root = env::var("CODE_SERVER_ROOT").expect("CODE_SERVER_ROOT is required");
-    assert!(
-        !version.is_empty() && !root.is_empty(),
-        "code-server build metadata is empty"
-    );
-    println!("cargo:rerun-if-changed={archive}");
-    generated.push_str(&format!(
-        "pub static CODE_SERVER_ARCHIVE: &[u8] = include_bytes!({archive:?});\n"
-    ));
+    let read = |key: &str| env::var(key).ok().filter(|value| !value.is_empty());
+    let url = read("CODE_SERVER_URL").unwrap_or_default();
+    let checksum = read("CODE_SERVER_SHA256").unwrap_or_default();
+    let version = read("CODE_SERVER_VERSION").unwrap_or_default();
+    let root = read("CODE_SERVER_ROOT").unwrap_or_default();
+    let size: u64 = read("CODE_SERVER_SIZE")
+        .map(|value| value.parse().expect("CODE_SERVER_SIZE must be a number"))
+        .unwrap_or(0);
+    if !url.is_empty() {
+        assert!(url.starts_with("https://"), "CODE_SERVER_URL must be https");
+        assert!(
+            checksum.len() == 64 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "CODE_SERVER_SHA256 must be a SHA-256 hex digest"
+        );
+        assert!(
+            !version.is_empty() && !root.is_empty(),
+            "code-server build metadata is empty"
+        );
+    }
+    generated.push_str(&format!("pub static CODE_SERVER_URL: &str = {url:?};\n"));
+    generated.push_str(&format!("pub static CODE_SERVER_SIZE: u64 = {size};\n"));
     generated.push_str(&format!(
         "pub static CODE_SERVER_SHA256: &str = {checksum:?};\n"
     ));
@@ -102,7 +99,7 @@ fn main() {
         ));
     }
     generated.push_str("];\n");
-    server_archive(&mut generated);
+    server_release(&mut generated);
     let output = Path::new(&env::var("OUT_DIR").expect("output directory")).join("ui_assets.rs");
     fs::write(output, generated).expect("write embedded asset index");
     println!("cargo:rerun-if-changed=ui/manifest.json");

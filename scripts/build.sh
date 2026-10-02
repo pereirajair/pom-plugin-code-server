@@ -48,15 +48,18 @@ fi
 if [[ "$extension" == dll ]]; then artifact="${artifact_dir}/pom_plugin_code_server.dll"; else artifact="${artifact_dir}/libpom_plugin_code_server.${extension}"; fi
 
 "$root/scripts/build-ui.sh"
-runtime_output="$("$root/scripts/fetch-runtime.sh" --platform "$platform" --code-server-version "$code_server_version")"
-archive="$(printf '%s\n' "$runtime_output" | sed -n 's/^archive=//p')"
+# Only the release metadata is embedded; the node downloads the release itself.
+runtime_output="$("$root/scripts/fetch-runtime.sh" --platform "$platform" --code-server-version "$code_server_version" --metadata-only)"
+url="$(printf '%s\n' "$runtime_output" | sed -n 's/^url=//p')"
 checksum="$(printf '%s\n' "$runtime_output" | sed -n 's/^sha256=//p')"
+archive_size="$(printf '%s\n' "$runtime_output" | sed -n 's/^size=//p')"
 resolved_version="$(printf '%s\n' "$runtime_output" | sed -n 's/^version=//p')"
 server_root="$(printf '%s\n' "$runtime_output" | sed -n 's/^server_root=//p')"
-[[ -f "$archive" ]] || die 'official code-server archive is missing'
+[[ "$url" == https://* ]] || die 'official code-server release URL is missing'
 (
   cd "$root"
-  CODE_SERVER_ARCHIVE="$archive" \
+  CODE_SERVER_URL="$url" \
+    CODE_SERVER_SIZE="$archive_size" \
     CODE_SERVER_SHA256="$checksum" \
     CODE_SERVER_VERSION="$resolved_version" \
     CODE_SERVER_ROOT="$server_root" \

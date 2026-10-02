@@ -2,7 +2,9 @@
 
 Runs the official [coder/code-server](https://github.com/coder/code-server) web IDE in the POM admin interface, with its workspace set to the POM shared workspace. Open **Code-server** from the POM sidebar to use the VS Code editor and integrated terminal on the POM node.
 
-The code-server release is installed in the plugin package build and embedded in its native library. POM nodes need no first-start internet access. Build/package scripts verify the upstream GitHub SHA-256 digest before embedding the release. User settings and extensions persist separately from the replaceable runtime.
+The plugin package pins one official code-server release (URL, GitHub-published SHA-256, version) but does not contain it, so it stays a few megabytes. On its first activation the node downloads that release once, verifies the digest and unpacks it; the editor screen shows the progress. User settings and extensions persist separately from the replaceable runtime.
+
+The editor's built-in chat uses the POM's models with no GitHub account: the plugin configures them automatically from the gateway the POM shares with plugins (see [docs/README.md](docs/README.md#pom-models-in-the-editor-chat)).
 
 The menu and route are admin-only: code-server can execute commands as the POM process and access node files. The service binds to loopback with code-server authentication disabled; browser traffic is gated by POM's same-origin, admin-authorized plugin proxy and a private per-launch upstream token.
 

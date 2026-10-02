@@ -6,7 +6,7 @@ use std::panic;
 use std::sync::Arc;
 
 mod supervisor;
-use supervisor::{Configuration, Supervisor};
+use supervisor::{Configuration, Release, Supervisor};
 
 const ABI_VERSION: u32 = 1;
 static VERSION: &[u8] = b"0.1.0\0";
@@ -115,6 +115,16 @@ fn query_inner(state: &PluginState, request: &[u8]) -> Result<Value, String> {
         }
         "host.event" => Ok(json!({"status": "ok"})),
         "ui.upstream" => Ok(state.supervisor.status().upstream_json()),
+        // Screen API through the POM's plugin RPC: install progress and retry.
+        "rpc.runtime.status" => Ok(state.supervisor.status().to_json()),
+        "rpc.runtime.retry" => {
+            if request["profile"].as_str() != Some("admin") {
+                return Ok(json!({"error": "admin_required"}));
+            }
+            Ok(
+                json!({"status": if state.supervisor.retry() { "starting" } else { "unconfigured" }}),
+            )
+        }
         "ui.runtime.json" => Ok(state.supervisor.status().to_json()),
         "ui.manifest" => ui_manifest(),
         "ui.asset" => {
@@ -143,10 +153,13 @@ unsafe extern "C" fn create(_: HostCallbacks, config: ByteSlice) -> PluginHandle
             serde_json::from_slice::<Value>(config).map_err(|error| error.to_string())?;
         }
         let supervisor = Supervisor::new(
-            CODE_SERVER_ARCHIVE,
-            CODE_SERVER_SHA256,
-            CODE_SERVER_VERSION,
-            CODE_SERVER_ROOT,
+            Release {
+                url: CODE_SERVER_URL,
+                size: CODE_SERVER_SIZE,
+                checksum: CODE_SERVER_SHA256,
+                version: CODE_SERVER_VERSION,
+                server_root: CODE_SERVER_ROOT,
+            },
             LAUNCHER,
         );
         Ok::<_, String>(Box::into_raw(Box::new(PluginState { supervisor })).cast::<c_void>())

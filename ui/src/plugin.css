@@ -85,6 +85,30 @@
   to { transform: rotate(360deg); }
 }
 
+.cs-progress {
+  position: relative;
+  width: min(28rem, 100%);
+  height: 0.5rem;
+  margin-top: 0.75rem;
+  border-radius: 999px;
+  background: rgb(var(--line) / 0.6);
+  overflow: visible;
+}
+.cs-progress-bar {
+  height: 100%;
+  border-radius: 999px;
+  background: rgb(var(--iris));
+  transition: width 400ms ease;
+}
+.cs-progress-label {
+  display: block;
+  margin-top: 0.5rem;
+  text-align: center;
+  font-size: 0.72rem;
+  color: rgb(var(--muted));
+  font-variant-numeric: tabular-nums;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .cs-spinner { animation: none; }
 }

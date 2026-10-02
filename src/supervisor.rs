@@ -1,14 +1,18 @@
 //! Supervises the official code-server release next to the plugin host.
 //!
-//! The release archive is embedded at package-build time, verified again before
-//! extraction, and unpacked once per checksum. User settings/extensions live in
-//! `data/`, separately from the replaceable runtime. The launcher and code-server
-//! never inherit the plugin host's IPC stdin/stdout or its private environment.
+//! The package only pins the release (URL, SHA-256, version). On the first
+//! activation the archive is downloaded from the official GitHub release,
+//! verified against the pinned digest and unpacked once per checksum, with the
+//! progress published as `installing`. User settings/extensions live in
+//! `data/`, separately from the replaceable runtime. The launcher and
+//! code-server never inherit the plugin host's IPC stdin/stdout or its private
+//! environment; the POM gateway key reaches only the launcher, which keeps it
+//! on the server side of its model facade.
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,9 +22,47 @@ use std::time::Duration;
 
 const PLUGIN_DIR: &str = "code_server";
 
+/// The POM's OpenAI-compatible endpoint and the key minted for this plugin.
+#[derive(Clone, PartialEq)]
+pub struct Gateway {
+    pub base_url: String,
+    pub api_key: String,
+}
+
+impl std::fmt::Debug for Gateway {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Gateway")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Configuration {
     pub workspace_root: Option<PathBuf>,
+    /// Absent on POMs that do not share a gateway: the editor still runs,
+    /// only the chat has no POM models.
+    pub gateway: Option<Gateway>,
+}
+
+/// `{"gateway": {"openai_base_url": "...", "api_key": "..."}}`, when usable.
+fn gateway_from(request: &Value) -> Option<Gateway> {
+    let gateway = request.get("gateway")?;
+    let base_url = gateway
+        .get("openai_base_url")?
+        .as_str()?
+        .trim()
+        .trim_end_matches('/');
+    let api_key = gateway.get("api_key")?.as_str()?.trim();
+    let scheme_ok = base_url.starts_with("http://") || base_url.starts_with("https://");
+    (scheme_ok && !api_key.is_empty() && !api_key.chars().any(char::is_whitespace)).then(|| {
+        Gateway {
+            base_url: base_url.to_owned(),
+            api_key: api_key.to_owned(),
+        }
+    })
 }
 
 impl Configuration {
@@ -37,7 +79,10 @@ impl Configuration {
             }
             Some(_) => return Err("workspace_root must be a string or null".into()),
         };
-        Ok(Self { workspace_root })
+        Ok(Self {
+            workspace_root,
+            gateway: gateway_from(request),
+        })
     }
 }
 
@@ -45,6 +90,12 @@ impl Configuration {
 pub enum Status {
     Unconfigured,
     Starting,
+    /// Downloading the pinned release; `total` is 0 when unknown.
+    Installing {
+        downloaded: u64,
+        total: u64,
+        version: String,
+    },
     Ready {
         port: u16,
         token: String,
@@ -57,6 +108,14 @@ impl Status {
     pub fn to_json(&self) -> Value {
         match self {
             Status::Unconfigured | Status::Starting => json!({"status": "starting"}),
+            Status::Installing {
+                downloaded,
+                total,
+                version,
+            } => json!({
+                "status": "installing",
+                "detail": {"downloaded": downloaded, "total": total, "version": version}
+            }),
             Status::Ready { detail, .. } => json!({"status": "ready", "detail": detail}),
             Status::Failed(error) => json!({"status": "error", "error": error}),
         }
@@ -68,7 +127,9 @@ impl Status {
                 json!({"status": "ready", "port": port, "token": token})
             }
             Status::Failed(error) => json!({"status": "error", "error": error}),
-            Status::Unconfigured | Status::Starting => json!({"status": "starting"}),
+            Status::Unconfigured | Status::Starting | Status::Installing { .. } => {
+                json!({"status": "starting"})
+            }
         }
     }
 }
@@ -78,11 +139,18 @@ struct Process {
     stdin: ChildStdin,
 }
 
+/// The pinned official release this package downloads.
+#[derive(Debug, Clone, Copy)]
+pub struct Release {
+    pub url: &'static str,
+    pub size: u64,
+    pub checksum: &'static str,
+    pub version: &'static str,
+    pub server_root: &'static str,
+}
+
 pub struct Supervisor {
-    archive: &'static [u8],
-    checksum: &'static str,
-    version: &'static str,
-    server_root: &'static str,
+    release: Release,
     launcher: &'static str,
     status: Mutex<Status>,
     process: Mutex<Option<Process>>,
@@ -92,18 +160,9 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(
-        archive: &'static [u8],
-        checksum: &'static str,
-        version: &'static str,
-        server_root: &'static str,
-        launcher: &'static str,
-    ) -> Arc<Self> {
+    pub fn new(release: Release, launcher: &'static str) -> Arc<Self> {
         Arc::new(Self {
-            archive,
-            checksum,
-            version,
-            server_root,
+            release,
             launcher,
             status: Mutex::new(Status::Unconfigured),
             process: Mutex::new(None),
@@ -129,13 +188,34 @@ impl Supervisor {
         }
     }
 
+    /// Starts again with the last configuration, e.g. after a failed download.
+    pub fn retry(self: &Arc<Self>) -> bool {
+        let configuration = self
+            .configuration
+            .lock()
+            .ok()
+            .and_then(|current| current.clone());
+        match configuration {
+            Some(configuration) => {
+                self.start(configuration, true);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Starts/restarts after POM configuration changes; startup never blocks IPC.
     pub fn configure(self: &Arc<Self>, configuration: Configuration) {
+        self.start(configuration, false);
+    }
+
+    fn start(self: &Arc<Self>, configuration: Configuration, force: bool) {
         let generation = {
             let Ok(mut current) = self.configuration.lock() else {
                 return;
             };
-            if current.as_ref() == Some(&configuration)
+            if !force
+                && current.as_ref() == Some(&configuration)
                 && !matches!(self.status(), Status::Failed(_))
             {
                 return;
@@ -158,11 +238,12 @@ impl Supervisor {
     }
 
     fn run(&self, generation: u64, configuration: &Configuration) -> Result<(), String> {
-        if self.archive.is_empty() {
-            return Err("this build does not bundle the code-server runtime".into());
-        }
-        if self.server_root.is_empty() || self.version.is_empty() {
-            return Err("this build has incomplete code-server metadata".into());
+        let release = self.release;
+        if release.url.is_empty() || release.server_root.is_empty() || release.version.is_empty() {
+            return Err(
+                "this build has no pinned code-server release; package it with scripts/package.sh"
+                    .into(),
+            );
         }
         let base = plugin_directory()?;
         let data = base.join("data");
@@ -182,18 +263,27 @@ impl Supervisor {
             if self.generation.load(Ordering::SeqCst) != generation {
                 return Ok(());
             }
-            unpack_runtime(
+            install_runtime(
                 &base.join("runtime"),
-                self.archive,
-                self.checksum,
-                self.server_root,
+                &release,
                 self.launcher,
+                |downloaded, total| {
+                    self.set_status(
+                        generation,
+                        Status::Installing {
+                            downloaded,
+                            total,
+                            version: release.version.to_owned(),
+                        },
+                    );
+                    self.generation.load(Ordering::SeqCst) == generation
+                },
             )?
         };
         if self.generation.load(Ordering::SeqCst) != generation {
             return Ok(());
         }
-        let code_root = runtime.join(self.server_root);
+        let code_root = runtime.join(release.server_root);
         let node = code_root
             .join("lib")
             .join(if cfg!(windows) { "node.exe" } else { "node" });
@@ -218,7 +308,7 @@ impl Supervisor {
             .env("POM_CODE_SERVER_ROOT", &code_root)
             .env("POM_CODE_SERVER_DATA_DIR", &data)
             .env("POM_CODE_SERVER_WORKSPACE", &workspace)
-            .env("POM_CODE_SERVER_VERSION", self.version)
+            .env("POM_CODE_SERVER_VERSION", release.version)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -240,6 +330,13 @@ impl Supervisor {
         }
         if !cfg!(windows) {
             command.env("POM_CODE_SERVER_SHELL", "/bin/bash");
+        }
+        // The launcher serves POM models to the editor's chat; the key stays
+        // in its process and never reaches code-server or the browser.
+        if let Some(gateway) = &configuration.gateway {
+            command
+                .env("POM_GATEWAY_BASE_URL", &gateway.base_url)
+                .env("POM_GATEWAY_API_KEY", &gateway.api_key);
         }
         let mut child = command
             .spawn()
@@ -281,7 +378,7 @@ impl Supervisor {
         let token = reply["token"]
             .as_str()
             .ok_or("launcher reported no proxy token")?;
-        let detail = json!({"version": self.version});
+        let detail = json!({"version": release.version});
         self.set_status(
             generation,
             Status::Ready {
@@ -377,37 +474,142 @@ fn plugin_directory() -> Result<PathBuf, String> {
     Ok(parent.join(PLUGIN_DIR))
 }
 
-/// Verify and atomically unpack the official release once per content digest.
-pub fn unpack_runtime(
-    root: &Path,
-    archive: &[u8],
-    checksum: &str,
-    server_root: &str,
-    launcher: &str,
-) -> Result<PathBuf, String> {
+fn runtime_ready(target: &Path, server_root: &str) -> bool {
+    target.join(".complete").is_file()
+        && target.join(server_root).join("lib").is_dir()
+        && target.join("launcher.mjs").is_file()
+}
+
+fn validate_release(checksum: &str, server_root: &str) -> Result<(), String> {
     if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("code-server archive checksum is invalid".into());
     }
     if server_root.is_empty() || Path::new(server_root).components().count() != 1 {
         return Err("code-server release directory is invalid".into());
     }
-    let id = &checksum[..16];
-    let target = root.join(id);
-    if target.join(".complete").is_file()
-        && target.join(server_root).join("lib").is_dir()
-        && target.join("launcher.mjs").is_file()
+    Ok(())
+}
+
+/// Downloads `url` into `destination`, reporting progress. `progress` returns
+/// false to abandon the download (a newer configuration replaced this one).
+pub fn download(
+    url: &str,
+    destination: &Path,
+    expected_size: u64,
+    mut progress: impl FnMut(u64, u64) -> bool,
+) -> Result<(), String> {
+    let mut agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(20))
+        .timeout_read(Duration::from_secs(60));
+    if let Some(proxy) = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+        .and_then(|value| ureq::Proxy::new(value).ok())
     {
+        agent = agent.proxy(proxy);
+    }
+    let response = agent
+        .build()
+        .get(url)
+        .call()
+        .map_err(|error| format!("download code-server: {error}"))?;
+    let total = response
+        .header("content-length")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(expected_size);
+    let mut reader = response.into_reader();
+    let mut file = fs::File::create(destination)
+        .map_err(|error| format!("{}: {error}", destination.display()))?;
+    let mut buffer = vec![0_u8; 256 * 1024];
+    let mut downloaded = 0_u64;
+    let mut last_report = std::time::Instant::now();
+    if !progress(0, total) {
+        return Err("download cancelled".into());
+    }
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("download code-server: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])
+            .map_err(|error| format!("write code-server download: {error}"))?;
+        downloaded += read as u64;
+        if last_report.elapsed() >= Duration::from_millis(250) {
+            last_report = std::time::Instant::now();
+            if !progress(downloaded, total) {
+                return Err("download cancelled".into());
+            }
+        }
+    }
+    file.sync_all()
+        .map_err(|error| format!("write code-server download: {error}"))?;
+    progress(downloaded, total.max(downloaded));
+    Ok(())
+}
+
+/// Makes sure the pinned release is unpacked: reuses a complete runtime,
+/// otherwise downloads, verifies and unpacks it.
+pub fn install_runtime(
+    root: &Path,
+    release: &Release,
+    launcher: &str,
+    progress: impl FnMut(u64, u64) -> bool,
+) -> Result<PathBuf, String> {
+    validate_release(release.checksum, release.server_root)?;
+    let target = root.join(&release.checksum[..16]);
+    if runtime_ready(&target, release.server_root) {
         return Ok(target);
     }
-    let actual = format!("{:x}", Sha256::digest(archive));
-    if !actual.eq_ignore_ascii_case(checksum) {
+    fs::create_dir_all(root).map_err(|error| format!("{}: {error}", root.display()))?;
+    let archive = root.join(format!(".{}.tar.gz", &release.checksum[..16]));
+    let reusable = fs::read(&archive)
+        .map(|bytes| format!("{:x}", Sha256::digest(&bytes)).eq_ignore_ascii_case(release.checksum))
+        .unwrap_or(false);
+    if !reusable {
+        download(release.url, &archive, release.size, progress)?;
+    }
+    let result = unpack_archive_file(
+        root,
+        &archive,
+        release.checksum,
+        release.server_root,
+        launcher,
+    );
+    let _ = fs::remove_file(&archive);
+    result
+}
+
+/// Verify and atomically unpack an archive file once per content digest.
+pub fn unpack_archive_file(
+    root: &Path,
+    archive: &Path,
+    checksum: &str,
+    server_root: &str,
+    launcher: &str,
+) -> Result<PathBuf, String> {
+    validate_release(checksum, server_root)?;
+    let id = &checksum[..16];
+    let target = root.join(id);
+    if runtime_ready(&target, server_root) {
+        return Ok(target);
+    }
+    let mut hasher = Sha256::new();
+    let mut file =
+        fs::File::open(archive).map_err(|error| format!("{}: {error}", archive.display()))?;
+    std::io::copy(&mut file, &mut hasher)
+        .map_err(|error| format!("read code-server archive: {error}"))?;
+    if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(checksum) {
         return Err("code-server archive checksum mismatch".into());
     }
     fs::create_dir_all(root).map_err(|error| format!("{}: {error}", root.display()))?;
     let partial = root.join(format!(".{id}.partial"));
     let _ = fs::remove_dir_all(&partial);
     fs::create_dir_all(&partial).map_err(|error| format!("{}: {error}", partial.display()))?;
-    let mut unpacker = tar::Archive::new(flate2::read::GzDecoder::new(archive));
+    let file =
+        fs::File::open(archive).map_err(|error| format!("{}: {error}", archive.display()))?;
+    let mut unpacker = tar::Archive::new(flate2::read::GzDecoder::new(BufReader::new(file)));
     unpacker.set_preserve_permissions(true);
     unpacker
         .unpack(&partial)
@@ -426,7 +628,8 @@ pub fn unpack_runtime(
         .map_err(|error| format!("install code-server runtime: {error}"))?;
     if let Ok(entries) = fs::read_dir(root) {
         for entry in entries.flatten() {
-            if entry.file_name() != id {
+            let name = entry.file_name();
+            if name != id && !name.to_string_lossy().ends_with(".tar.gz") {
                 let _ = fs::remove_dir_all(entry.path());
             }
         }
@@ -479,6 +682,101 @@ mod tests {
     }
 
     #[test]
+    fn configuration_reads_the_pom_gateway_and_hides_its_key() {
+        let parsed = Configuration::from_configure(&json!({
+            "gateway": {"openai_base_url": "http://127.0.0.1:8080/v1/", "api_key": "sk-pom"}
+        }))
+        .unwrap();
+        let gateway = parsed.gateway.clone().unwrap();
+        assert_eq!(gateway.base_url, "http://127.0.0.1:8080/v1");
+        assert_eq!(gateway.api_key, "sk-pom");
+        assert!(!format!("{parsed:?}").contains("sk-pom"));
+        for bad in [
+            json!({"gateway": {"openai_base_url": "file:///etc", "api_key": "k"}}),
+            json!({"gateway": {"openai_base_url": "http://x/v1", "api_key": " "}}),
+            json!({"gateway": {"openai_base_url": "http://x/v1"}}),
+        ] {
+            assert!(Configuration::from_configure(&bad)
+                .unwrap()
+                .gateway
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn installing_status_reports_progress_but_proxies_nothing() {
+        let installing = Status::Installing {
+            downloaded: 10,
+            total: 100,
+            version: "4.1".into(),
+        };
+        assert_eq!(
+            installing.to_json(),
+            json!({"status": "installing", "detail": {"downloaded": 10, "total": 100, "version": "4.1"}})
+        );
+        assert_eq!(installing.upstream_json(), json!({"status": "starting"}));
+    }
+
+    #[test]
+    fn the_release_is_downloaded_verified_and_reused() {
+        use std::io::{Read as _, Write as _};
+        let root = test_root();
+        let bytes = archive(&[("code-server-dl/lib/node", b"node")]);
+        let digest: &'static str =
+            Box::leak(format!("{:x}", Sha256::digest(&bytes)).into_boxed_str());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let served = bytes.clone();
+        let server = thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    served.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(&served).unwrap();
+            }
+        });
+        let url: &'static str =
+            Box::leak(format!("http://{address}/release.tar.gz").into_boxed_str());
+        let release = Release {
+            url,
+            size: bytes.len() as u64,
+            checksum: digest,
+            version: "4.1",
+            server_root: "code-server-dl",
+        };
+        let mut reports = Vec::new();
+        let runtime = install_runtime(&root, &release, "// launcher", |done, total| {
+            reports.push((done, total));
+            true
+        })
+        .unwrap();
+        assert!(runtime.join("code-server-dl/lib/node").is_file());
+        assert_eq!(
+            reports.last(),
+            Some(&(bytes.len() as u64, bytes.len() as u64))
+        );
+        // A complete runtime is reused without downloading again.
+        assert_eq!(
+            install_runtime(&root, &release, "", |_, _| panic!("no download")).unwrap(),
+            runtime
+        );
+
+        // A tampered download is refused.
+        let bad = Release {
+            checksum: Box::leak("0".repeat(64).into_boxed_str()),
+            ..release
+        };
+        assert!(install_runtime(&test_root(), &bad, "", |_, _| true).is_err());
+        let _ = server.join();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn status_exposes_neither_the_proxy_token_nor_runtime_address_to_the_screen() {
         let ready = Status::Ready {
             port: 48123,
@@ -494,6 +792,21 @@ mod tests {
             Status::Starting.upstream_json(),
             json!({"status": "starting"})
         );
+    }
+
+    fn unpack_runtime(
+        root: &Path,
+        bytes: &[u8],
+        digest: &str,
+        server_root: &str,
+        launcher: &str,
+    ) -> Result<PathBuf, String> {
+        fs::create_dir_all(root).unwrap();
+        let file = root.with_extension(format!("{}.tar.gz", &digest[..8]));
+        fs::write(&file, bytes).unwrap();
+        let result = unpack_archive_file(root, &file, digest, server_root, launcher);
+        let _ = fs::remove_file(file);
+        result
     }
 
     #[test]

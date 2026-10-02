@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
-# Fetches the official, standalone code-server release for the selected target.
-# The archive is checksum-verified here and embedded into the POM plugin during
-# the native build, so installed nodes do not download code-server at startup.
+# Resolves the official, standalone code-server release for the selected target.
+# With --metadata-only (what the package build uses) it prints the asset URL,
+# its GitHub-published SHA-256 and size, and downloads nothing: the plugin
+# downloads and verifies the release on the node after it is installed, so the
+# plugin package stays small. Without the flag it also downloads and verifies
+# the archive (useful to inspect a release locally).
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 platform=""
 version="${CODE_SERVER_VERSION:-latest}"
 output="${root}/build"
+metadata_only=false
 
 usage() {
   printf '%s\n' \
     'Usage: scripts/fetch-runtime.sh --platform <linux-x86_64|macos-aarch64|windows-x86_64> [options]' \
     '  --code-server-version <tag|version>  official code-server release (default: latest)' \
-    '  --output <dir>                       download directory (default: build)'
+    '  --output <dir>                       download directory (default: build)' \
+    '  --metadata-only                      resolve URL, SHA-256 and size without downloading'
 }
 
 die() {
@@ -30,6 +35,7 @@ while (($# > 0)); do
     --platform) (($# >= 2)) || die '--platform requires a value'; platform="$2"; shift 2 ;;
     --code-server-version) (($# >= 2)) || die '--code-server-version requires a value'; version="$2"; shift 2 ;;
     --output) (($# >= 2)) || die '--output requires a value'; output="$2"; shift 2 ;;
+    --metadata-only) metadata_only=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
@@ -66,6 +72,14 @@ digest="$(jq -er --arg asset "$asset" '.assets[] | select(.name == $asset) | .di
   || die "release $resolved_tag does not publish a SHA-256 digest for $asset"
 [[ "$digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]] || die "invalid GitHub SHA-256 digest for $asset"
 expected="${digest#sha256:}"
+size="$(jq -er --arg asset "$asset" '.assets[] | select(.name == $asset) | .size | numbers' <<<"$release")" \
+  || die "release $resolved_tag has no size for $asset"
+server_root="${asset%.tar.gz}"
+if [[ "$metadata_only" == true ]]; then
+  printf 'url=%s\nsha256=%s\nsize=%s\nversion=%s\nserver_root=%s\nplatform=%s\nasset=%s\n' \
+    "$asset_url" "$expected" "$size" "$resolved_version" "$server_root" "$platform" "$asset"
+  exit 0
+fi
 
 mkdir -p "$output/downloads"
 archive="${output}/downloads/${asset}"
@@ -77,7 +91,6 @@ actual="$(sha256 "$archive")"
 [[ "$actual" == "$expected" ]] || die "SHA-256 mismatch for $asset"
 
 # Verify the upstream tarball has the root directory expected by the runtime.
-server_root="${asset%.tar.gz}"
 tar -tzf "$archive" | awk -v root="$server_root/" 'index($0, root) == 1 { found=1 } END { exit !found }' \
   || die "release archive does not contain $server_root"
 printf '%s\n' "$actual" > "${archive}.sha256"

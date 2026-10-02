@@ -146,7 +146,9 @@ fn native_plugin_uses_the_host_abi_and_authenticated_upstream_contract() {
     }
     assert!(lib.contains("pom_code_server_plugin_v1"));
     let supervisor = text("src/supervisor.rs");
-    assert!(supervisor.contains("Sha256::digest(archive)"));
+    // The node verifies the downloaded release against the pinned digest.
+    assert!(supervisor.contains("code-server archive checksum mismatch"));
+    assert!(supervisor.contains("POM_GATEWAY_API_KEY"));
     assert!(!supervisor.contains("x-pom-plugin-token"));
     let launcher = text("runtime/launcher.mjs");
     assert!(launcher.contains("x-pom-plugin-token"));
@@ -157,13 +159,17 @@ fn native_plugin_uses_the_host_abi_and_authenticated_upstream_contract() {
 }
 
 #[test]
-fn package_build_checks_the_official_release_digest_before_embedding() {
+fn package_build_pins_the_official_release_digest_without_embedding_it() {
     let fetch = text("scripts/fetch-runtime.sh");
     assert!(fetch.contains(".digest"));
     assert!(fetch.contains("SHA-256 mismatch"));
+    assert!(fetch.contains("--metadata-only"));
     let build = text("scripts/build.sh");
-    assert!(build.contains("CODE_SERVER_ARCHIVE=\"$archive\""));
+    assert!(build.contains("--metadata-only"));
+    assert!(build.contains("CODE_SERVER_URL=\"$url\""));
     assert!(build.contains("CODE_SERVER_SHA256=\"$checksum\""));
+    assert!(!build.contains("CODE_SERVER_ARCHIVE"));
+    assert!(!text("build.rs").contains("include_bytes!({archive"));
     assert!(root().join("scripts/package.sh").is_file());
     assert!(root().join("runtime/launcher.mjs").is_file());
     assert!(root().join("AGENTS.md").is_file());
